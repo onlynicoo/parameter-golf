@@ -116,7 +116,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16() if torch.cuda.get_device_capability(G.device)[0] >= 8 else G.half()
+    X = G.bfloat16()
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -156,8 +156,7 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
-            _muon_dtype = torch.bfloat16 if torch.cuda.get_device_capability(params[0].device)[0] >= 8 else torch.float16
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=_muon_dtype)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
             curr = 0
             for i, p in enumerate(params):
@@ -278,7 +277,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -355,7 +354,7 @@ def eval_val_sliding(
                 x_batch[i, :wlen] = chunk[:-1]
                 y_batch[i, :wlen] = chunk[1:]
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = base_model.forward_logits(x_batch)
 
             nll = F.cross_entropy(
@@ -1044,10 +1043,10 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    # RTX 2080 Ti (sm75) doesn't support flash attention or bf16; auto-detect
+    # Flash attention requires Ampere+ (sm80); older GPUs use mem_efficient/math
     _sm = torch.cuda.get_device_capability(device)
-    _use_flash = _sm >= (8, 0)  # Ampere+
-    _amp_dtype = torch.bfloat16 if _sm >= (8, 0) else torch.float16
+    _use_flash = _sm >= (8, 0)
+    _amp_dtype = torch.bfloat16  # always bf16 — fp16 causes NaN due to limited range
     enable_cudnn_sdp(False)
     enable_flash_sdp(_use_flash)
     enable_mem_efficient_sdp(not _use_flash)
@@ -1124,7 +1123,7 @@ def main() -> None:
         bigram_hash_dim=args.bigram_hash_dim,
         use_smeargate=args.use_smeargate,
         use_ortho_init=args.use_ortho_init,
-    ).to(device).to(_amp_dtype)
+    ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1252,7 +1251,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1324,7 +1323,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
