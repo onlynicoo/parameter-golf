@@ -13,7 +13,7 @@ LOG_DIR="/cluster/scratch/nlorenzon/logs/param-golf"
 CONDA_ENV="/cluster/scratch/nlorenzon/envs/param-golf"
 
 # Defaults (override via --export or environment)
-GPU_TYPE="${GPU_TYPE:-rtx_4090}"
+GPU_TYPE="${GPU_TYPE:-rtx_2080_ti}"
 N_GPUS="${N_GPUS:-4}"
 
 mkdir -p "$LOG_DIR"
