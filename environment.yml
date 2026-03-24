@@ -1,0 +1,21 @@
+name: param-golf
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - torch
+    - numpy
+    - sentencepiece
+    - huggingface-hub
+    - datasets
+    - tqdm
+    - zstandard
+    - tiktoken
+    - kernels
+    - setuptools
+    - typing-extensions==4.15.0
