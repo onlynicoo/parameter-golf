@@ -94,12 +94,22 @@ class Hyperparameters:
     tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
     matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     weight_decay: float = float(os.environ.get("WEIGHT_DECAY", 0.04))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # v2 features
+    use_smeargate: bool = bool(int(os.environ.get("USE_SMEARGATE", "1")))
+    bigram_hash_buckets: int = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_dim: int = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+    swa_enabled: bool = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_start_frac: float = float(os.environ.get("SWA_START_FRAC", 0.4))
+    swa_every: int = int(os.environ.get("SWA_EVERY", 50))
+    use_ortho_init: bool = bool(int(os.environ.get("USE_ORTHO_INIT", "1")))
+    prune_frac: float = float(os.environ.get("PRUNE_FRAC", 0.03))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -131,7 +141,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smeargate,bigram_hash.scale",
     ).split(",")
     if pattern
 )
@@ -299,6 +309,44 @@ class RMSNormNoWeight(nn.Module):
         return rms_norm(x)
 
 
+class SmearGate(nn.Module):
+    """Blend each token embedding with the previous token's embedding via a learned gate."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        g = mx.sigmoid(self.gate).astype(x.dtype)[None, None, :]
+        x_prev = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+        return (1.0 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash consecutive token pairs into a learned embedding table."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        self.embed.weight = mx.zeros_like(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            self.proj.weight = mx.zeros_like(self.proj.weight)
+        self.scale = mx.array(0.05, dtype=mx.float32)
+
+    def bigram_hash(self, tokens: mx.array) -> mx.array:
+        t = tokens.astype(mx.int32)
+        mod = self.bigram_vocab_size - 1
+        bos = mx.full(t.shape[:-1] + (1,), mod, dtype=mx.int32)
+        hashed = ((36313 * t[..., 1:]) ^ (27191 * t[..., :-1])) % mod
+        return mx.concatenate([bos, hashed], axis=-1)
+
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.astype(h.dtype)
+
+
 class CausalSelfAttention(nn.Module):
     # - separate q/k/v projections
     # - RMSNorm on q and k before attention
@@ -386,6 +434,15 @@ class Block(nn.Module):
         return x
 
 
+def _orthogonal_init(shape: tuple[int, ...], gain: float = 1.0) -> mx.array:
+    """Orthogonal initialization via SVD (MLX lacks nn.init.orthogonal_)."""
+    flat_shape = (shape[0], int(np.prod(shape[1:])))
+    a = np.random.standard_normal(flat_shape).astype(np.float32)
+    u, _, vt = np.linalg.svd(a, full_matrices=False)
+    q = u if u.shape == flat_shape else vt
+    return mx.array(q.reshape(shape) * gain, dtype=mx.float32)
+
+
 class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
@@ -393,7 +450,8 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, bigram_hash_buckets: int = 0, bigram_hash_dim: int = 128,
+                 use_smeargate: bool = True, use_ortho_init: bool = True):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -401,6 +459,8 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.bigram_hash = BigramHashEmbedding(bigram_hash_buckets, bigram_hash_dim, dim) if bigram_hash_buckets > 0 else None
+        self.smeargate = SmearGate(dim) if use_smeargate else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -414,6 +474,11 @@ class GPT(nn.Module):
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            if use_ortho_init:
+                for linear in [b.attn.c_q, b.attn.c_k, b.attn.c_v, b.mlp.fc]:
+                    w = linear.weight
+                    if w.ndim == 2 and min(w.shape) >= 64:
+                        linear.weight = _orthogonal_init(w.shape, gain=1.0)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -423,7 +488,12 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids)
+        x = rms_norm(x)
+        if self.smeargate is not None:
+            x = self.smeargate(x)
         x0 = x
         skips: list[mx.array] = []
 
@@ -501,15 +571,24 @@ class SplitOptimizers:
         self.args = args
         params = dict(tree_flatten(model.parameters()))
         self.embed_key = "tok_emb.weight"
+        # Bigram embed is also an embedding table -> Adam embed LR
+        self.extra_embed_keys = [k for k in params if k == "bigram_hash.embed.weight"]
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if p.ndim == 2
+            and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            and k != self.embed_key
+            and k not in self.extra_embed_keys
+            and (k.startswith("blocks.") or k == "bigram_hash.proj.weight")
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_weights"
+            or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            or (k.startswith("smeargate.") and k not in self.matrix_keys)
+            or (k.startswith("bigram_hash.") and k not in self.matrix_keys and k not in self.extra_embed_keys)
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -534,12 +613,10 @@ class SplitOptimizers:
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
 
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
-        updated.update(
-            self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
-            )
-        )
+        embed_keys = [self.embed_key] + self.extra_embed_keys
+        embed_grads = {k: grads[k] for k in embed_keys if k in grads}
+        embed_params = {k: params[k] for k in embed_keys if k in params}
+        updated.update(self.adam_embed.apply_gradients(embed_grads, embed_params))
 
         self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
         scalar_grads = {k: grads[k] for k in self.scalar_keys}
@@ -681,6 +758,8 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
+    if "bigram_hash" in name:
+        return "bigram"
     if ".mlp." in name:
         return "mlp"
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
@@ -992,6 +1071,10 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
+        use_smeargate=args.use_smeargate,
+        use_ortho_init=args.use_ortho_init,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1044,6 +1127,8 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
+    log(f"smeargate:{args.use_smeargate} bigram_hash_buckets:{args.bigram_hash_buckets} bigram_hash_dim:{args.bigram_hash_dim}")
+    log(f"ortho_init:{args.use_ortho_init} swa:{args.swa_enabled} swa_start_frac:{args.swa_start_frac} swa_every:{args.swa_every} prune_frac:{args.prune_frac}")
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
@@ -1089,6 +1174,10 @@ def main() -> None:
         mx.synchronize()
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+
+    # SWA state
+    swa_state: dict[str, np.ndarray] | None = None
+    swa_count = 0
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
@@ -1139,6 +1228,18 @@ def main() -> None:
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
+        # SWA: collect checkpoints during warmdown
+        if args.swa_enabled and lr_mul < args.swa_start_frac and step % args.swa_every == 0:
+            current_flat = {k: np.array(v, copy=True) for k, v in tree_flatten(model.state)}
+            if swa_state is None:
+                swa_state = {k: v.astype(np.float64) for k, v in current_flat.items()}
+                swa_count = 1
+                log(f"swa:start step:{step}")
+            else:
+                for k in swa_state:
+                    swa_state[k] = swa_state[k] + current_flat[k].astype(np.float64)
+                swa_count += 1
+
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
@@ -1150,6 +1251,41 @@ def main() -> None:
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
+
+    # ==============================================================================
+    # SWA APPLICATION
+    # ==============================================================================
+    if args.swa_enabled and swa_state is not None and swa_count > 1:
+        log(f"swa:applying averaged {swa_count} checkpoints")
+        current_flat = dict(tree_flatten(model.state))
+        avg_items = []
+        for k, v_sum in swa_state.items():
+            avg_np = (v_sum / swa_count).astype(np.array(current_flat[k]).dtype)
+            avg_items.append((k, mx.array(avg_np, dtype=current_flat[k].dtype)))
+        model.update(tree_unflatten(avg_items))
+        mx.eval(model.state)
+
+    # ==============================================================================
+    # MAGNITUDE PRUNING
+    # ==============================================================================
+    if args.prune_frac > 0:
+        flat_state_items = list(tree_flatten(model.state))
+        pruned_count = 0
+        total_count = 0
+        new_items = []
+        for k, v in flat_state_items:
+            if v.ndim == 2 and int(v.size) > 65536:
+                v_np = np.array(v, dtype=np.float32)
+                threshold = float(np.quantile(np.abs(v_np), args.prune_frac))
+                mask = np.abs(v_np) >= threshold
+                pruned_count += int(np.sum(~mask))
+                total_count += int(v_np.size)
+                v_np[~mask] = 0.0
+                new_items.append((k, mx.array(v_np, dtype=v.dtype)))
+            else:
+                new_items.append((k, v))
+        model.update(tree_unflatten(new_items))
+        log(f"magnitude_pruning: pruned {pruned_count}/{total_count} weights ({100*pruned_count/max(total_count,1):.1f}%)")
 
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
